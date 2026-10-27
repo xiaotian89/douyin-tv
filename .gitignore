@@ -1,0 +1,33 @@
+# 凭证与个人数据（绝不入库）
+dy_cookies_box.txt
+*_cookies*.txt
+cookie*.txt
+*.cookie
+follow_all.json
+follow_all.new.json
+follow_state.json
+*.log
+
+# 签名与构建产物
+*.jks
+*.keystore
+*.apk
+*.apk.idsig
+build/
+*.class
+*.dex
+*.dex.jar
+
+# 编辑器
+*.bak
+*.bak.*
+*.577bak
+*.578bak
+*.585bak
+*.586bak
+.idea/
+.DS_Store
+
+# Chromium 运行时（构建时才需要，体积大）
+dyposts-img/browsers/
+dyposts-img/py/

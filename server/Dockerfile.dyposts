@@ -1,0 +1,24 @@
+# dyposts：抖音作品抓取服务（真 Chromium 接 aweme/post 响应）
+# 基于 dyhub:2；Chromium 与 playwright 包从容器里取出放到 build 目录，避免每次构建重下 191MB
+FROM dyhub:2
+
+# Chromium 运行时依赖
+RUN DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+      libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+      libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+      libgbm1 libpango-1.0-0 libcairo2 libasound2 \
+ && rm -rf /var/lib/apt/lists/*
+
+# playwright 包（从已装好的容器里拷出来）
+COPY py/playwright /opt/pw-lib/playwright
+ENV PYTHONPATH=/opt/pw-lib
+
+# Chromium 本体
+COPY browsers /opt/pw-browsers
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+
+ENV PYTHONUNBUFFERED=1
+WORKDIR /data
+EXPOSE 8920
+CMD ["-u", "/data/dyposts.py"]
