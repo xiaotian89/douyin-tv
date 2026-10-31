@@ -1,0 +1,12 @@
+services:
+  imgcache:
+    image: dyposts:v1
+    container_name: imgcache
+    restart: unless-stopped
+    ports:
+      - "8940:8940"
+    volumes:
+      - /vol1/1000/docker/compose/openclaw:/data
+    environment:
+      - TZ=Asia/Shanghai
+    command: ["-u", "/data/imgcache.py"]

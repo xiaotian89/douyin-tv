@@ -77,6 +77,7 @@ public class Api {
     }
 
     public Api(Activity act) {
+        ImageLoader.init(act.getApplicationContext());
         ctx = act;
         www = makeHost("https://www.douyin.com/robots.txt");
         // 关键：把 www 上的登录 cookie 复制一份给 live.douyin.com。
@@ -965,6 +966,10 @@ public class Api {
             }
 
             public void onError(final String msg) {
+                if (msg != null && msg.indexOf("已下播") >= 0) {
+                    cb.onError("已下播");       // 下播了重试也没用，立刻返回
+                    return;
+                }
                 post(new Runnable() {
                     public void run() {
                         if (attempt >= 3) {
@@ -1006,10 +1011,21 @@ public class Api {
                     JSONArray arr = new JSONObject(json).optJSONArray("rooms");
                     if (arr != null && arr.length() > 0) {
                         JSONObject r = arr.optJSONObject(0);
-                        if (r != null && r.optString("flv").length() > 0) {
-                            cb.onJson(r.toString());
-                            return;
+                        if (r != null) {
+                            if (r.optString("flv").length() > 0) {
+                                cb.onJson(r.toString());
+                                return;
+                            }
+                            // status=4 就是直播已结束：别再去抓包/重试，直接告诉界面
+                            if (r.optInt("status", -1) == 4) {
+                                cb.onError("已下播");
+                                return;
+                            }
                         }
+                    }
+                    if (json != null && json.indexOf("\"status\":4") >= 0) {
+                        cb.onError("已下播");
+                        return;
                     }
                 } catch (Exception ignored) {
                 }

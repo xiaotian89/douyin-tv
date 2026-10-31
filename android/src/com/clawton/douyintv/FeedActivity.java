@@ -406,7 +406,7 @@ public class FeedActivity extends Activity {
                 String body = null;
                 try {
                     java.net.HttpURLConnection c = (java.net.HttpURLConnection)
-                            new java.net.URL("http://192.168.2.70:8930/posts?sec=" + secUid + "&pages=1")
+                            new java.net.URL(Cache.json("http://192.168.2.70:8930/posts?sec=" + secUid + "&pages=1", 900))
                                     .openConnection();
                     c.setConnectTimeout(8000);
                     c.setReadTimeout(70000);
@@ -477,8 +477,8 @@ public class FeedActivity extends Activity {
                 String body = null;
                 try {
                     java.net.HttpURLConnection c = (java.net.HttpURLConnection)
-                            new java.net.URL("http://192.168.2.70:8930/posts?sec=" + sec
-                                    + "&pages=" + want).openConnection();
+                            new java.net.URL(Cache.json("http://192.168.2.70:8930/posts?sec=" + sec
+                                    + "&pages=" + want, 900)).openConnection();
                     c.setConnectTimeout(8000);
                     c.setReadTimeout(90000);
                     java.io.InputStream in = c.getInputStream();
@@ -536,8 +536,8 @@ public class FeedActivity extends Activity {
                 String body = null;
                 try {
                     java.net.HttpURLConnection c = (java.net.HttpURLConnection)
-                            new java.net.URL("http://192.168.2.70:8912/authors?offset="
-                                    + offset + "&n=" + n).openConnection();
+                            new java.net.URL(Cache.json("http://192.168.2.70:8912/authors?offset="
+                                    + offset + "&n=" + n, 300)).openConnection();
                     c.setConnectTimeout(8000);
                     c.setReadTimeout(20000);
                     java.io.InputStream in = c.getInputStream();
@@ -605,7 +605,7 @@ public class FeedActivity extends Activity {
                 if (sec.length() < 10) continue;
                 Item it = new Item();
                 it.title = a.optString("nick");
-                it.author = a.optBoolean("live") ? "直播中" : "";
+                it.author = "";   // 作者卡不显示「直播中」标签
                 it.secUid = sec;
                 it.cover = a.optString("avatar");
                 out.add(it);
@@ -849,29 +849,28 @@ public class FeedActivity extends Activity {
             FrameLayout card = new FrameLayout(FeedActivity.this);
             boolean follow = (mode == MODE_FOLLOW);
             int w = dp(300);
-            int imgH = follow ? dp(300) : dp(169);   // 关注页用方形图区，头像不再糊成一团
+            int imgH = follow ? dp(300) : dp(240);   // 海报区：作者卡方形，作品卡竖一点
             int h = imgH + dp(52);
             card.setLayoutParams(new GridView.LayoutParams(w, h));
 
             ImageView img = new ImageView(FeedActivity.this);
-            // 头像用 CENTER_CROP 填满方形，CENTER_INSIDE 会缩在中间显小
             img.setScaleType(ImageView.ScaleType.CENTER_CROP);
             img.setBackgroundColor(Color.parseColor("#1A1A20"));
             FrameLayout.LayoutParams ip = new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, imgH);
             card.addView(img, ip);
             if (it.cover.length() > 0) {
-                ImageLoader.get().load(it.cover, img, dp(follow ? 460 : 300));
+                ImageLoader.get().load(it.cover, img, dp(480));
             }
 
             // 底部渐变 + 标题
             View scrim = new View(FeedActivity.this);
-            GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
-                    new int[]{0xE6000000, 0x00000000});
-            scrim.setBackground(g);
+            scrim.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
+                    new int[]{0xE6000000, 0x00000000}));
             FrameLayout.LayoutParams sp = new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, dp(70));
             sp.gravity = Gravity.BOTTOM;
+            sp.setMargins(0, 0, 0, dp(52));
             card.addView(scrim, sp);
 
             TextView t = new TextView(FeedActivity.this);
@@ -883,24 +882,24 @@ public class FeedActivity extends Activity {
             FrameLayout.LayoutParams tp = new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             tp.gravity = Gravity.BOTTOM;
-            tp.setMargins(dp(10), 0, dp(10), dp(8));
+            tp.setMargins(dp(10), 0, dp(10), dp(30));
             card.addView(t, tp);
 
-            // 作者 + 时长（主播卡片不显示时长）
+            // 作者 + 时长 + 点赞
             TextView meta = new TextView(FeedActivity.this);
             String dur = it.dur > 0 ? " · " + fmtDur(it.dur) : "";
             String digg = it.digg > 0 ? " · " + fmtNum(it.digg) : "";
-            meta.setText(it.author + dur + digg);
+            meta.setText((follow ? "" : it.author) + dur + digg);
             meta.setTextColor(Color.parseColor("#B9B9C0"));
             meta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
             meta.setMaxLines(1);
             FrameLayout.LayoutParams mp = new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             mp.gravity = Gravity.BOTTOM;
-            mp.setMargins(dp(10), 0, dp(10), dp(34));
+            mp.setMargins(dp(10), 0, dp(10), dp(8));
             card.addView(meta, mp);
 
-            // GridView 自己持有焦点，卡片只按「选中」状态画高亮（子 View 抢焦点会让 OK 键失灵）
+            // 卡片底色 + 选中高亮
             boolean sel = (pos == adapter.selPos);
             GradientDrawable gd = new GradientDrawable();
             gd.setCornerRadius(dp(10));
@@ -908,8 +907,8 @@ public class FeedActivity extends Activity {
             gd.setStroke(dp(sel ? 3 : 1),
                     sel ? Color.parseColor("#FF2C55") : Color.parseColor("#25252C"));
             card.setBackground(gd);
-            card.setScaleX(sel ? 1.04f : 1f);
-            card.setScaleY(sel ? 1.04f : 1f);
+            card.setScaleX(sel ? 1.03f : 1f);
+            card.setScaleY(sel ? 1.03f : 1f);
             card.setFocusable(false);
             return card;
         }

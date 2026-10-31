@@ -59,6 +59,9 @@ public class LiveGridActivity extends Activity {
     private boolean tabFocused = false;
     private int failCount = 0;
     private final List<Room> followCache = new ArrayList<Room>();
+    /** 直播列表分页：每页条数 / 当前已显示 */
+    private static final int LIVE_PAGE = 40;
+    private int liveShown = LIVE_PAGE;
     private final List<Room> recommendCache = new ArrayList<Room>();
 
     private int dp(float v) {
@@ -135,6 +138,15 @@ public class LiveGridActivity extends Activity {
         grid.setVerticalScrollBarEnabled(false);
         adapter = new RoomAdapter();
         grid.setAdapter(adapter);
+        grid.setOnScrollListener(new android.widget.AbsListView.OnScrollListener() {
+            public void onScrollStateChanged(android.widget.AbsListView v, int st) {
+            }
+
+            public void onScroll(android.widget.AbsListView v, int first, int visible, int total) {
+                if (total > 0 && first + visible >= total - 5) loadMoreLive();
+            }
+        });
+
         grid.setOnItemClickListener(new android.widget.AdapterView.OnItemClickListener() {
             public void onItemClick(android.widget.AdapterView<?> p, View v, int pos, long id) {
                 openRoom(rooms.get(pos));
@@ -356,23 +368,27 @@ public class LiveGridActivity extends Activity {
                     }
                 }
                 android.util.Log.i(TAG, "关注直播 offset=" + offset + " 本页 " + l.size() + " 新增 " + added);
-                if (added > 0 && offset < 60) {
+                if (added > 0 && offset < 200) {
                     loadFollowFeed(offset + 20, acc, seen);
                     return;
                 }
                 if (acc.isEmpty()) {
-                    // 官方接口没给东西，退回逐个查状态
-                    loadFollowLivingV2();
+                    // 官方接口没给东西，退回中继（有封面和列表，但可能缺房间号）
+                    android.util.Log.i(TAG, "关注页签没数据，退回中继");
+                    loadFromServer(false);
                     return;
                 }
-                followCache.clear();
-                followCache.addAll(acc);
-                swap(acc);
+                if (followCache.size() > acc.size()) {
+                    mergeLive(acc);
+                } else {
+                    applyLive(acc);
+                }
+                if (followCache.size() < 60) loadFromServer(false);   // 缺就补一次中继
             }
 
             public void onError(String msg) {
-                android.util.Log.w(TAG, "关注直播接口失败 " + msg);
-                loadFollowLivingV2();
+                android.util.Log.w(TAG, "关注直播接口失败 " + msg + "，退回中继");
+                loadFromServer(false);
             }
         });
     }
@@ -553,7 +569,7 @@ public class LiveGridActivity extends Activity {
     private String fetchFollowJson() {
         try {
             java.net.HttpURLConnection c = (java.net.HttpURLConnection)
-                    new java.net.URL("http://192.168.2.70:8912/follow").openConnection();
+                    new java.net.URL(Cache.json("http://192.168.2.70:8912/follow", 20)).openConnection();
             c.setConnectTimeout(5000);
             c.setReadTimeout(20000);
             java.io.InputStream in = c.getInputStream();
@@ -614,7 +630,8 @@ public class LiveGridActivity extends Activity {
             public void run() {
                 String body = null;
                 try {
-                    String u = "http://192.168.2.70:8912/follow" + (force ? "?force=1" : "");
+                    String u = Cache.json("http://192.168.2.70:8912/follow" + (force ? "?force=1" : ""),
+                            force ? 5 : 20);
                     java.net.HttpURLConnection c = (java.net.HttpURLConnection)
                             new java.net.URL(u).openConnection();
                     c.setConnectTimeout(5000);
@@ -645,8 +662,13 @@ public class LiveGridActivity extends Activity {
                                     JSONObject j = arr.optJSONObject(i);
                                     if (j == null) continue;
                                     Room r = new Room();
-                                    r.webRid = j.optString("rid");
-                                    r.roomId = r.webRid;
+                                    // 取流必须用数字房间号：中继的 rid 可能是抖音号
+                                    String wr = j.optString("web_rid");
+                                    if (wr.length() == 0) wr = j.optString("room_id");
+                                    if (wr.length() == 0) wr = j.optString("rid");
+                                    r.webRid = wr;
+                                    r.roomId = wr;
+                                    r.uid = j.optString("uid");
                                     r.nick = j.optString("nick");
                                     r.title = j.optString("title");
                                     r.cover = j.optString("cover");
@@ -674,8 +696,8 @@ public class LiveGridActivity extends Activity {
                         followCache.clear();
                         followCache.addAll(list);
                         lastSig = sigOf(list);
-                        swap(list);
                         saveFollowCache(list);
+                        applyLive(list);
                         if (!quietStarted) {
                             quietStarted = true;
                             grid.postDelayed(quietTick, 60000);
@@ -694,7 +716,9 @@ public class LiveGridActivity extends Activity {
         if (followCache.size() > 0) spin(false, "正在刷新关注主播…");
         else spin(true, "正在查关注主播有没有开播…");
         pushCookies();
-        loadFromServer(false);
+        // 盒子自己的「关注」页签能拿到可播的 12 位房间号，作为主数据源；
+        // 中继列表更全但缺房间号，只做兜底
+        loadFollowFeed(0, new ArrayList<Room>(), new java.util.HashSet<String>());
     }
 
     /** 方案二入口：钩页面自己的关注接口 → 解析 JSON → 上图；失败再退回 DOM 抓取 */
@@ -1281,6 +1305,135 @@ public class LiveGridActivity extends Activity {
         if (api != null) api.quiet();
     }
 
+    /** 页签拿到的房间（带可用房间号）并进现有列表；顺带把不可播的排到后面 */
+    private void mergeLive(List<Room> hookRooms) {
+        if (hookRooms == null || hookRooms.isEmpty()) return;
+        java.util.Map<String, Room> byNick = new java.util.HashMap<String, Room>();
+        for (int i = 0; i < hookRooms.size(); i++) {
+            Room r = hookRooms.get(i);
+            if (r.nick != null && r.nick.length() > 0) byNick.put(r.nick, r);
+        }
+        int fixed = 0;
+        for (int i = 0; i < followCache.size(); i++) {
+            Room cur = followCache.get(i);
+            Room h = byNick.get(cur.nick);
+            if (h == null) continue;
+            if (cur.webRid != null && cur.webRid.length() >= 8 && isNum(cur.webRid)) continue;
+            cur.webRid = h.webRid;
+            cur.roomId = h.webRid;
+            if (cur.cover.length() == 0) cur.cover = h.cover;
+            fixed++;
+        }
+        // 页签里还没进列表的，补到后面
+        java.util.Set<String> have = new java.util.HashSet<String>();
+        for (int i = 0; i < followCache.size(); i++) have.add(followCache.get(i).nick);
+        for (int i = 0; i < hookRooms.size(); i++) {
+            Room h = hookRooms.get(i);
+            if (!have.contains(h.nick)) followCache.add(h);
+        }
+        // 有房间号的排前面，点进去就能播
+        java.util.Collections.sort(followCache, new java.util.Comparator<Room>() {
+            public int compare(Room a, Room b) {
+                boolean pa = isNum(a.webRid) && a.webRid.length() >= 8;
+                boolean pb = isNum(b.webRid) && b.webRid.length() >= 8;
+                if (pa == pb) return 0;
+                return pa ? -1 : 1;
+            }
+        });
+        liveShown = Math.min(LIVE_PAGE, followCache.size());
+        swap(new ArrayList<Room>(followCache.subList(0, liveShown)));
+        android.util.Log.i(TAG, "合并直播列表：补房间号 " + fixed + " 个，共 " + followCache.size() + " 位");
+    }
+
+    /** 能取流：带 flv，或房间号是 12 位上下的数字 */
+    private boolean playable(Room r) {
+        if (r == null) return false;
+        if (r.flv != null && r.flv.length() > 0) return true;
+        return isNum(r.webRid) && r.webRid.length() >= 8 && r.webRid.length() <= 14;
+    }
+
+    private boolean isNum(String v) {
+        if (v == null || v.length() == 0) return false;
+        for (int i = 0; i < v.length(); i++) {
+            if (v.charAt(i) < '0' || v.charAt(i) > '9') return false;
+        }
+        return true;
+    }
+
+    /** JSON 字符串转义 */
+    private String jesc(String v) {
+        if (v == null) return "";
+        return v.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    /** 把这次拿到的 12 位房间号回传中继（它自己算不出来，只能靠盒子） */
+    private void pushWebrids(List<Room> l) {
+        final StringBuilder sb = new StringBuilder("[");
+        int n = 0;
+        for (int i = 0; i < l.size(); i++) {
+            Room r = l.get(i);
+            if (r.nick == null || r.nick.length() == 0) continue;
+            if (!isNum(r.webRid) || r.webRid.length() < 8 || r.webRid.length() > 14) continue;
+            if (n > 0) sb.append(',');
+            sb.append("{\"nick\":\"").append(jesc(r.nick)).append("\",\"web_rid\":\"").append(r.webRid).append("\"}");
+            n++;
+        }
+        sb.append(']');
+        if (n == 0) return;
+        final String body = "{\"items\":" + sb + "}";
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                            new java.net.URL("http://192.168.2.70:8912/webrids").openConnection();
+                    c.setRequestMethod("POST");
+                    c.setDoOutput(true);
+                    c.setConnectTimeout(5000);
+                    c.setReadTimeout(8000);
+                    c.getOutputStream().write(body.getBytes("UTF-8"));
+                    c.getResponseCode();
+                    android.util.Log.i(TAG, "回传房间号 " + body.length() + " 字节");
+                } catch (Exception e) {
+                    android.util.Log.w(TAG, "回传房间号失败 " + e);
+                }
+            }
+        }).start();
+    }
+
+    /** 收到完整列表：存起来，只显示第一页，滚动再续 */
+    private void applyLive(List<Room> full) {
+        // 排序：可播优先（有 12 位房间号或已带 flv 的排前面）
+        try {
+            java.util.Collections.sort(full, new java.util.Comparator<Room>() {
+                public int compare(Room a, Room b) {
+                    boolean pa = playable(a), pb = playable(b);
+                    if (pa == pb) return 0;
+                    return pa ? -1 : 1;
+                }
+            });
+        } catch (Exception ignored) {
+        }
+        followCache.clear();
+        followCache.addAll(full);
+        liveShown = Math.min(LIVE_PAGE, full.size());
+        swap(new ArrayList<Room>(full.subList(0, liveShown)));
+        android.util.Log.i(TAG, "直播列表 " + full.size() + " 位（每页显示 " + LIVE_PAGE + "）");
+        pushWebrids(full);
+    }
+
+    /** 滚到末尾时把后面一页并进来（数据已全在本地，不重新请求） */
+    private void loadMoreLive() {
+        if (tab != TAB_FOLLOW || followCache.isEmpty()) return;
+        if (rooms.size() >= followCache.size()) return;
+        int from = rooms.size();
+        int to = Math.min(from + LIVE_PAGE, followCache.size());
+        if (to <= from) return;
+        rooms.addAll(new ArrayList<Room>(followCache.subList(from, to)));
+        adapter.notifyDataSetChanged();
+        android.util.Log.i(TAG, "直播列表加载更多：" + from + " → " + to
+                + " / 共 " + followCache.size());
+    }
+
     private void swap(List<Room> l) {
         rooms.clear();
         rooms.addAll(l);
@@ -1426,9 +1579,13 @@ public class LiveGridActivity extends Activity {
             play(r);
             return;
         }
-        if (r.webRid == null || r.webRid.length() == 0) {
-            android.widget.Toast.makeText(this, "这个房间没拿到房间号",
-                    android.widget.Toast.LENGTH_SHORT).show();
+        if (r.webRid == null || r.webRid.length() == 0 || !isNum(r.webRid)
+                || r.webRid.length() < 8 || r.webRid.length() > 14) {
+            // 不是 12 位数字房间号（拿到的是抖音号或空）→ 取流必然失败，别去重试
+            android.widget.Toast.makeText(this,
+                    "「" + (r.nick == null ? "" : r.nick) + "」暂时取不到流（缺房间号，等它下次开播自动补）",
+                    android.widget.Toast.LENGTH_LONG).show();
+            android.util.Log.i(TAG, "跳过取流：房间号无效 " + r.webRid);
             return;
         }
         // 先问一次房间接口（单次请求，能拿到 FULL_HD1 高清档）
@@ -1459,9 +1616,42 @@ public class LiveGridActivity extends Activity {
             }
 
             public void onError(String msg) {
+                if (msg != null && msg.indexOf("已下播") >= 0) {
+                    ended(r);
+                    return;
+                }
                 flvByPage(r);
             }
         });
+    }
+
+    /** 已下播：提示并从列表移除，不留在那儿让人反复点 */
+    private void ended(final Room r) {
+        spin(false, "");
+        try {
+            android.widget.Toast.makeText(LiveGridActivity.this,
+                    "「" + (r.nick == null ? "" : r.nick) + "」已下播",
+                    android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Exception ignored) {
+        }
+        android.util.Log.i(TAG, "已下播，移出列表：" + r.nick);
+        boolean removed = false;
+        for (int i = rooms.size() - 1; i >= 0; i--) {
+            Room x = rooms.get(i);
+            if ((x.webRid != null && x.webRid.equals(r.webRid))
+                    || (x.nick != null && x.nick.equals(r.nick))) {
+                rooms.remove(i);
+                removed = true;
+            }
+        }
+        for (int i = followCache.size() - 1; i >= 0; i--) {
+            Room x = followCache.get(i);
+            if (x.nick != null && x.nick.equals(r.nick)) followCache.remove(i);
+        }
+        if (removed) {
+            adapter.notifyDataSetChanged();
+            if (rooms.isEmpty()) spin(false, "关注的主播现在都没开播");
+        }
     }
 
     private void flvByPage(final Room r) {
@@ -1486,8 +1676,7 @@ public class LiveGridActivity extends Activity {
                 } catch (Exception ignored) {
                 }
                 if (got.length() == 0) {
-                    android.widget.Toast.makeText(LiveGridActivity.this,
-                            "没抓到直播流，可能刚开始播或已下播", android.widget.Toast.LENGTH_LONG).show();
+                    ended(r);
                     return;
                 }
                 android.util.Log.i(TAG, "LIVE 抓到流 " + got.substring(0, Math.min(90, got.length())));
@@ -1497,8 +1686,12 @@ public class LiveGridActivity extends Activity {
 
             public void onError(String msg) {
                 spin(false, "");
+                if (msg != null && msg.indexOf("已下播") >= 0) {
+                    ended(r);
+                    return;
+                }
                 android.widget.Toast.makeText(LiveGridActivity.this,
-                        "拿直播流失败：" + msg, android.widget.Toast.LENGTH_LONG).show();
+                        "拿直播流失败：" + msg, android.widget.Toast.LENGTH_SHORT).show();
             }
         });
     }

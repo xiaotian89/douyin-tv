@@ -31,6 +31,35 @@ public class ImageLoader {
         return sInst;
     }
 
+    private static java.io.File diskDir;
+
+    /** 由 Api/Activity 传入一次即可；之后封面走「内存 → 磁盘 → 网络」 */
+    public static void init(android.content.Context c) {
+        if (diskDir != null || c == null) return;
+        try {
+            diskDir = new java.io.File(c.getCacheDir(), "covers");
+            if (!diskDir.exists()) diskDir.mkdirs();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static String diskKey(String url, int reqW) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            byte[] d = md.digest((url + "#" + reqW).getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 10; i++) sb.append(String.format("%02x", d[i]));
+            return sb.toString();
+        } catch (Throwable t) {
+            return String.valueOf(url.hashCode());
+        }
+    }
+
+    private static java.io.File diskFile(String url, int reqW) {
+        if (diskDir == null) return null;
+        return new java.io.File(diskDir, diskKey(url, reqW) + ".jpg");
+    }
+
     private final LruCache<String, Bitmap> cache;
     private final ExecutorService pool = Executors.newFixedThreadPool(4);
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -53,7 +82,8 @@ public class ImageLoader {
     /** 只要位图，不要 ImageView */
     public void load(final String url, final int reqW, final OnBitmap cb) {
         if (url == null || url.length() == 0) return;
-        Bitmap hit = cache.get(url);
+        final String key = url + "#" + reqW;
+        Bitmap hit = cache.get(key);
         if (hit != null) {
             cb.done(hit);
             return;
@@ -62,7 +92,7 @@ public class ImageLoader {
             public void run() {
                 final Bitmap fb = fetch(url, reqW);
                 if (fb == null) return;
-                cache.put(url + "#" + reqW, fb);
+                cache.put(key, fb);
                 ui.post(new Runnable() {
                     public void run() { cb.done(fb); }
                 });
@@ -85,7 +115,8 @@ public class ImageLoader {
             BitmapFactory.decodeStream(in, null, o);
             in.close();
             int sample = 1;
-            while (o.outWidth / sample > reqW * 2 && sample < 8) sample *= 2;
+            int maxW = Math.min(reqW * 2, 640);
+            while (o.outWidth > 0 && o.outWidth / sample > maxW && sample < 8) sample *= 2;
             c.disconnect();
             c = (HttpURLConnection) new URL(url).openConnection();
             c.setConnectTimeout(8000);
@@ -98,7 +129,7 @@ public class ImageLoader {
             Bitmap b = BitmapFactory.decodeStream(in2, null, o2);
             in2.close();
             return b;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             android.util.Log.w("DouyinTV", "封面下载失败 " + e.getClass().getSimpleName());
             return null;
         } finally {
@@ -108,7 +139,8 @@ public class ImageLoader {
 
     public void load(final String url, final ImageView view, final int reqW) {
         if (url == null || url.length() == 0) return;
-        Bitmap hit = cache.get(url);
+        final String key = url + "#" + reqW;
+        Bitmap hit = cache.get(key);
         view.setTag(url);
         if (hit != null) {
             view.setImageBitmap(hit);
@@ -119,6 +151,23 @@ public class ImageLoader {
             public void run() {
                 Bitmap bmp = null;
                 HttpURLConnection c = null;
+                java.io.File df = diskFile(url, reqW);
+                if (df != null && df.exists() && df.length() > 500) {
+                    android.graphics.BitmapFactory.Options oo =
+                            new android.graphics.BitmapFactory.Options();
+                    oo.inSampleSize = 1;
+                    bmp = android.graphics.BitmapFactory.decodeFile(df.getAbsolutePath(), oo);
+                    if (bmp != null) {
+                        cache.put(key, bmp);
+                        final Bitmap fb = bmp;
+                        ui.post(new Runnable() {
+                            public void run() {
+                                if (url.equals(view.getTag())) view.setImageBitmap(fb);
+                            }
+                        });
+                        return;
+                    }
+                }
                 try {
                     c = (HttpURLConnection) new URL(url).openConnection();
                     c.setConnectTimeout(8000);
@@ -131,7 +180,9 @@ public class ImageLoader {
                     BitmapFactory.decodeStream(in, null, o);
                     in.close();
                     int sample = 1;
-                    while (o.outWidth / sample > reqW * 2 && sample < 8) sample *= 2;
+                    // 绝对上限 640px：太大了每张解码占几 MB，20 张就 OOM（2G 盒子实测）
+                    int maxW = Math.min(reqW * 2, 640);
+                    while (o.outWidth > 0 && o.outWidth / sample > maxW && sample < 8) sample *= 2;
                     c.disconnect();
                     c = (HttpURLConnection) new URL(url).openConnection();
                     c.setConnectTimeout(8000);
@@ -143,7 +194,18 @@ public class ImageLoader {
                     o2.inSampleSize = sample;
                     bmp = BitmapFactory.decodeStream(in2, null, o2);
                     in2.close();
-                } catch (Exception e) {
+                    if (bmp != null) {
+                        java.io.File dfo = diskFile(url, reqW);
+                        if (dfo != null) {
+                            try {
+                                java.io.FileOutputStream fo = new java.io.FileOutputStream(dfo);
+                                bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, fo);
+                                fo.close();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                } catch (Throwable e) {
                     android.util.Log.w("DouyinTV", "封面下载失败 " + e.getClass().getSimpleName()
                             + " " + url.substring(0, Math.min(60, url.length())));
                 } finally {

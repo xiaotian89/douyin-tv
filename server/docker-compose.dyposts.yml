@@ -1,0 +1,16 @@
+services:
+  # 抖音作品抓取（真 Chromium）：App 点开主播时从这里取作品列表
+  # 镜像构建：cd dyposts-img && docker build -t dyposts:v1 .
+  dyposts:
+    image: dyposts:v1
+    container_name: dyposts
+    restart: unless-stopped
+    user: "1000:1001"
+    working_dir: /data
+    ports:
+      - "8930:8920"
+    volumes:
+      - ./:/data
+    shm_size: 512m        # Chromium 必需，否则容易崩
+    environment:
+      - PYTHONUNBUFFERED=1
