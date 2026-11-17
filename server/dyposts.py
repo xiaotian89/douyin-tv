@@ -428,88 +428,76 @@ def _login_page():
     return LOGIN_PAGE[0]
 
 
+QR_API = ("https://www.douyin.com/passport/web/get_qrcode/?passport_jssdk_version=3.4.13-beta.9"
+          "&passport_jssdk_type=normal&is_from_ttaccountsdk=1&aid=6383&language=zh"
+          "&next=https%3A%2F%2Fwww.douyin.com&need_short_url=true&need_logo=false&is_new_login=1")
+QR_CHECK = ("https://www.douyin.com/passport/web/check_qrconnect/"
+            "?passport_jssdk_version=3.4.13-beta.9&passport_jssdk_type=normal"
+            "&is_from_ttaccountsdk=1&aid=6383&language=zh&account_app_language=en-US"
+            "&is_from_iesaccountsaas=1&p_ui=2.4.14-beta.9&p_ca=4.0.26&p_ca_real=1.0.0.998"
+            "&ts=%d&token=%s")
+QR_TOKEN = {"token": "", "ts": 0.0, "status": ""}
+
+
 def login_qr(force=False):
-    """截二维码（缓存 25 秒，避免扫码过程中刷新）"""
+    """向抖音官方接口要一张二维码（25 秒缓存）；失败时回退上一张未过期的码"""
     with LOCK:
         if not force and LOGIN_QR[0] and time.time() - LOGIN_QR[1] < 25:
             return LOGIN_QR[0]
-        if force:
-            # 过期后抖音不会自动换码，整页重建最干净
-            try:
-                if LOGIN_PAGE[0] is not None and not LOGIN_PAGE[0].is_closed():
-                    LOGIN_PAGE[0].close()
-            except Exception:
-                pass
-            LOGIN_PAGE[0] = None
-            LOGIN_QR[0], LOGIN_QR[1] = b"", 0.0
-        page = _login_page()
-
-        # 已经显示「已失效」就点一次刷新（没有刷新按钮就重开页面）
+        page = None
         try:
-            stale = page.evaluate("""() => {
-                const t = document.body ? document.body.innerText : '';
-                return (t.indexOf('失效') >= 0) || (t.indexOf('已过期') >= 0);
-            }""")
-            if stale:
-                clicked = page.evaluate("""() => {
-                    const els = Array.from(document.querySelectorAll('div,span,button,a,p'));
-                    const b = els.find(e => (e.textContent || '').trim() === '刷新');
-                    if (b) { b.click(); return true; }
-                    return false;
-                }""")
-                if not clicked:
-                    page.reload(wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(3000)
-                    page.evaluate("""() => {
-                        const els = Array.from(document.querySelectorAll('div,span,button,a'));
-                        const btn = els.find(e => (e.textContent || '').trim() === '登录');
-                        if (btn) btn.click();
-                    }""")
-                page.wait_for_timeout(3500)
+            page = _login_page()
         except Exception:
-            pass
-        png = b""
-        # 二维码是异步画的：等它出现，最多等 ~14 秒
-        for attempt in range(7):
-            try:
-                page.wait_for_timeout(2000)
-            except Exception:
+            page = None
+        raw = b""
+        tok = ""
+        for attempt in range(2):
+            if page is None:
                 break
             try:
-                el = page.query_selector("#animate_qrcode_container")
-                if el:
-                    box = el.bounding_box()
-                    if box and box["width"] > 120:
-                        shot = el.screenshot(type="png")
-                        if len(shot) > 4000:
-                            LOGIN_QR[0], LOGIN_QR[1] = shot, time.time()
-                            return shot
+                r = page.request.get(QR_API + "&ts=%d" % int(time.time()), timeout=20000)
+                d = (r.json() or {}).get("data") or {}
+                b64 = d.get("qrcode") or ""
+                ntok = d.get("token") or ""
+                if b64:
+                    import base64 as _b64
+                    cand = _b64.b64decode(b64)
+                    if len(cand) >= 800:
+                        raw, tok = cand, ntok
+                        break
             except Exception:
                 pass
-        # 优先截登录面板元素，退化为整页顶部区域
-        for sel in ("#animate_qrcode_container",
-                    "img.RhjdbXj8",
-                    "#douyin_login_comp_flat_panel", "#login-panel-new",
-                    "div[class*=login]"):
             try:
-                el = page.query_selector(sel)
-                if el:
-                    box = el.bounding_box()
-                    if box and 120 < box["width"] < 320:
-                        png = el.screenshot(type="png")
-                        if len(png) > 3000:
-                            break
+                time.sleep(1.2)
             except Exception:
-                continue
-        if not png:
-            try:
-                png = page.screenshot(type="png",
-                                      clip={"x": 520, "y": 200, "width": 400, "height": 460})
-            except Exception:
-                png = b""
-        if png:
-            LOGIN_QR[0], LOGIN_QR[1] = png, time.time()
-        return png
+                pass
+        if not raw:
+            if LOGIN_QR[0] and time.time() - LOGIN_QR[1] < 300:
+                return LOGIN_QR[0]
+            return b""
+        QR_TOKEN["token"] = tok
+        QR_TOKEN["ts"] = time.time()
+        QR_TOKEN["status"] = "new"
+        LOGIN_QR[0], LOGIN_QR[1] = raw, time.time()
+        return raw
+
+
+def qr_status():
+    """问一次扫码状态，返回 new / scanned / confirmed / expired / ''"""
+    tok = QR_TOKEN.get("token") or ""
+    if not tok:
+        return ""
+    try:
+        page = _login_page()
+        u = QR_CHECK % (int(time.time()), tok)
+        r = page.request.get(u, timeout=10000)
+        d = (r.json() or {}).get("data") or {}
+        st = d.get("status") or ""
+        if st:
+            QR_TOKEN["status"] = st
+        return st
+    except Exception:
+        return ""
 
 
 def _login_nick():
@@ -569,6 +557,10 @@ def file_has_login():
 def login_state():
     """查登录态的上下文里有没有 sessionid"""
     try:
+        qr_status()
+    except Exception:
+        pass
+    try:
         cookies = _login_ctx().cookies("https://www.douyin.com")
     except Exception as e:
         return {"ok": False, "error": str(e)[:80]}
@@ -586,12 +578,14 @@ def login_state():
         else:
             nick = _login_nick()          # 落到「抖音精选」页时改走接口
     if has:
-        return {"ok": True, "nick": nick, "cookies": len(cookies), "src": "context"}
+        return {"ok": True, "nick": nick, "cookies": len(cookies), "src": "context",
+                "qr": QR_TOKEN.get("status") or ""}
 
     # 兜底：容器重启后登录上下文是空的，但落盘的 cookie 仍有效
     if file_has_login():
         return {"ok": True, "nick": "", "cookies": 0, "src": "file"}
-    return {"ok": False, "nick": "", "cookies": len(cookies)}
+    return {"ok": False, "nick": "", "cookies": len(cookies),
+            "qr": QR_TOKEN.get("status") or ""}
 
 
 def login_cookies():
@@ -735,6 +729,22 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def do_HEAD(self):
+        """播放器会先发 HEAD 探活，不回 200 它会直接放弃"""
+        path = self.path.split("?")[0]
+        if path == "/video":
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         LAST_REQ[0] = time.time()
         u = urlparse(self.path)
@@ -742,6 +752,12 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/health":
             return self._send(200, {"ok": True, "uptime": int(time.time() - START),
                                     "cache": len(CACHE)})
+        if u.path == "/login/raw":
+            try:
+                raw = open(COOKIE_FILE, encoding="utf-8", errors="ignore").read().strip()
+            except Exception:
+                raw = ""
+            return self._send(200, {"ok": bool(raw), "cookie": raw, "len": len(raw)})
         if u.path == "/login/qr":
             png = login_qr(force=("force=1" in self.path))
             if not png:
@@ -755,6 +771,11 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(png)
             return
+        if u.path == "/login/qrstate":
+            st = qr_status()
+            return self._send(200, {"token": (QR_TOKEN.get("token") or "")[:8],
+                                    "status": st or QR_TOKEN.get("status") or "",
+                                    "age": int(time.time() - (QR_TOKEN.get("ts") or time.time()))})
         if u.path == "/login/state":
             return self._send(200, login_state())
         if u.path == "/login/cookies":

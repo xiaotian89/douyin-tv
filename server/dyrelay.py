@@ -235,7 +235,7 @@ class H(BaseHTTPRequestHandler):
             t0 = time.time()
             # 关键：ffmpeg 的输出先进环形缓冲，再由另一个循环喂给客户端。
             # 客户端读得慢时只积压缓冲，不会把 ffmpeg 堵死（堵死会导致卡顿与音画漂移）。
-            PREBUF = 3072 * 1024      # 起播前先攒 1.5MB（约 1.5~3 秒），给播放器留余量
+            PREBUF = 1536 * 1024      # 起播缓冲 1.5MB（约 0.6~1 秒，实测攒满 1MB 仅 0.55s）
             MAXBUF = 20 * 1024 * 1024 # 缓冲上限，超过就不再读 ffmpeg
             chunks = collections.deque()
             state = {"total": 0, "eof": False}
@@ -266,8 +266,12 @@ class H(BaseHTTPRequestHandler):
 
             threading.Thread(target=pump, daemon=True).start()
 
+            # 滑动窗口采样：记录 (时间, 累计产量)，用于估算真实码率
+            prod_samples = collections.deque()
+
+
             # 攒够起播缓冲再开始发送
-            deadline = time.time() + 6
+            deadline = time.time() + 3
             with cond:
                 while state["total"] < PREBUF and not state["eof"] and time.time() < deadline:
                     cond.wait(0.2)
@@ -292,8 +296,29 @@ class H(BaseHTTPRequestHandler):
                                  sent / max(0.5, time.time() - t_start) / 1024), flush=True)
                         _last_log[1] = time.time()
                 _last_log[0] = sent
-                rate = max(600.0 * 1024, state.get("prod", 0) / max(0.5, time.time() - t_start))
-                wait = (t_start + sent / rate) - time.time()
+                # ---- 节拍器 v2：滑动平均速率 + 缓冲保护 ----
+                # 采样当前产量，只保留最近 4 秒
+                _now = time.time()
+                prod_samples.append((_now, state.get("prod", 0)))
+                while len(prod_samples) > 2 and _now - prod_samples[0][0] > 4.0:
+                    prod_samples.popleft()
+
+                if len(prod_samples) >= 2:
+                    _t0s, _p0s = prod_samples[0]
+                    _span = max(0.3, _now - _t0s)
+                    rate = max(200.0 * 1024, (state.get("prod", 0) - _p0s) / _span)
+                else:
+                    rate = 400.0 * 1024
+
+                with cond:
+                    _buf = state["total"]
+                # 缓冲不足 256KB（约半秒到一秒数据）时不要压节奏，立即发
+                if _buf < 256 * 1024:
+                    time.sleep(0)
+                else:
+                    wait = (_now + (len(b) / rate)) - time.time()
+                    if wait > 0:
+                        time.sleep(min(wait, 0.05))
                 if wait > 0:
                     time.sleep(min(wait, 0.25))
                 self.wfile.write(b)

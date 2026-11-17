@@ -44,7 +44,7 @@ SLOW_FILE = os.path.join(HERE, "SLOW_SCAN")
 PORT = int(os.environ.get("FOLLOW_PORT", "8912"))
 
 PAGE_GAP = float(os.environ.get("FOLLOW_PAGE_GAP", "10"))   # 每页间隔秒（别低于 4）
-STALE = int(os.environ.get("FOLLOW_STALE", "5400"))   # 在播状态有效期（默认 45 分钟）
+STALE = int(os.environ.get("FOLLOW_STALE", "1500"))   # 在播状态有效期（默认 45 分钟）
 PROBE_GAP = int(os.environ.get("FOLLOW_PROBE_GAP", "300"))   # 补漏探活间隔秒
 TOP_TTL = 120         # Top20 刷新间隔
 
@@ -229,6 +229,25 @@ def harvester():
                 _top["rooms"] = tops
                 _top["ts"] = time.time()
                 items = [{"nick": r.get("nick"), "web_rid": r.get("rid")} for r in tops]
+                # 抓到即视为在播：写入 live_ts，列表才有东西可展示
+                # 只认关注名单里的昵称，避免推荐流里的陌生人混进状态表
+                try:
+                    now_h = time.time()
+                    _nicks = _follow_nicks()
+                    with _lock:
+                        for it in items:
+                            nick = (it.get("nick") or "").strip()
+                            rid = str(it.get("web_rid") or "")
+                            if not nick or not rid.isdigit():
+                                continue
+                            if _nicks and nick not in _nicks:
+                                continue
+                            rec = _state["map"].get(nick) or {}
+                            rec.update({"nick": nick, "live_ts": now_h,
+                                        "web_rid": rid, "chk_ts": now_h})
+                            _state["map"][nick] = rec
+                except Exception as e:
+                    log("标记在播失败 %s" % str(e)[:50])
                 save_webrids(items, src="NAS轮询")
         except Exception as e:
             log("房间号轮询异常", str(e)[:50])
@@ -357,6 +376,24 @@ def fetch_stream(web_rid):
         ttl = STREAM_TTL if (hit["data"] or {}).get("ok") else STREAM_FAIL_TTL
         if now - hit["ts"] < ttl:
             return hit["data"]
+    # ── 快照优先：/follow 的 Top 列表里已经带真实 flv，直接用 ──────────
+    # 抖音 enter 接口现在返回 200+空body（反爬），打过去只会白等 2 秒再重试；
+    # 盒子端看到的是「点进直播间要等十几秒才出画面」。
+    try:
+        for _r in list(_top["rooms"]):
+            if str(_r.get("rid") or "") == web_rid and (_r.get("flv") or ""):
+                _data = {"ok": True, "web_rid": web_rid,
+                         "nick": _r.get("nick") or "", "title": _r.get("title") or "",
+                         "status": 2, "flv": _r["flv"],
+                         "flv_all": dict(_r.get("q") or {}),
+                         "hls": _r.get("hls") or "", "hls_all": {},
+                         "src": "snapshot"}
+                _stream_cache[web_rid] = {"ts": now, "data": _data}
+                log("取流命中快照 rid=%s nick=%s" % (web_rid, _data["nick"][:12]))
+                return _data
+    except Exception as _e:
+        log("快照取流异常 %s" % str(_e)[:60])
+
     q = {"aid": "6383", "app_name": "douyin_web", "live_id": "1",
          "device_platform": "web", "language": "zh-CN", "cookie_enabled": "true",
          "screen_width": "1920", "screen_height": "1080", "browser_language": "zh-CN",
@@ -624,6 +661,216 @@ def stats_writer():
         time.sleep(600)
 
 
+_PROBE_S = {"s": None, "ts": 0.0}
+
+
+def probe_session():
+    """巡检专用长连接：避免每次新建连接都要重新握手"""
+    now = time.time()
+    if _PROBE_S["s"] is None or now - _PROBE_S["ts"] > 1800:
+        s2 = requests.Session()
+        s2.headers.update({"User-Agent": UA, "Cookie": load_cookie(),
+                           "Referer": "https://live.douyin.com/"})
+        try:
+            from requests.adapters import HTTPAdapter
+            a = HTTPAdapter(pool_connections=4, pool_maxsize=8)
+            s2.mount("https://", a)
+        except Exception:
+            pass
+        _PROBE_S["s"] = s2
+        _PROBE_S["ts"] = now
+    return _PROBE_S["s"]
+
+
+_PROBE_LOGIN = {"s": None, "ts": 0.0}
+
+
+def _probe_login():
+    """巡检专用长连接（带登录态），30 分钟重建一次"""
+    now = time.time()
+    if _PROBE_LOGIN["s"] is None or now - _PROBE_LOGIN["ts"] > 1800:
+        try:
+            s2 = session()
+        except Exception:
+            s2 = probe_session()
+        try:
+            s2.headers.update({"Referer": "https://live.douyin.com/", "User-Agent": UA})
+        except Exception:
+            pass
+        _PROBE_LOGIN["s"] = s2
+        _PROBE_LOGIN["ts"] = now
+    return _PROBE_LOGIN["s"]
+
+
+def room_status(web_rid):
+    """问抖音这个房间还在不在播：2=在播 4=已结束 0=房间不存在 -1=探测失败
+
+    2026-11 起抖音对未签名的 enter 请求回 HTTP 200 + 空 body，
+    必须带登录态 + a_bogus 签名，否则一律 -1（曾导致列表只增不减）。
+    """
+    try:
+        q = {"web_rid": str(web_rid), "aid": "6383",
+             "device_platform": "web", "cookie_enabled": "true"}
+        try:
+            u = "https://live.douyin.com/webcast/room/web/enter/?" + sign(dict(q))
+        except Exception:
+            u = "https://live.douyin.com/webcast/room/web/enter/?" + urllib.parse.urlencode(q)
+        r = _probe_login().get(u, timeout=8)
+        if not r.content:
+            return -1
+        j = r.json()
+        data = (j.get("data") or {}).get("data") or []
+        if not data:
+            return 0
+        return int(data[0].get("status") or 0)
+    except Exception:
+        return -1
+
+
+_SCAN_HB = {"at": 0.0, "n": 0, "ok": 0, "down": 0, "fail": 0}
+
+
+def _scan_tick(kind):
+    _SCAN_HB["at"] = time.time()
+    _SCAN_HB["n"] += 1
+    if kind in _SCAN_HB:
+        _SCAN_HB[kind] += 1
+
+
+def live_scanner():
+    """只巡检「列表里正在展示」的房间：
+       下播能更快从列表消失，也不再把请求花在几百个已下播的缓存房间号上。
+       新开播的房间由采集器 follow_top 标记入库，不依赖这里发现。
+    """
+    time.sleep(90)
+    while True:
+        try:
+            items = []
+            try:
+                for r in publish() or []:
+                    nick = (r.get("nick") or "").strip()
+                    rid = str(r.get("web_rid") or r.get("rid") or "")
+                    if nick and rid.isdigit():
+                        items.append((nick, rid))
+            except Exception as e:
+                log("巡检取列表失败 %s" % str(e)[:50])
+            if not items:
+                items = list((load_webrids().get("map") or {}).items())
+            if not items:
+                _SCAN_HB["at"] = time.time()
+                time.sleep(60)
+                continue
+            with _lock:
+                items.sort(key=lambda kv: _rec_for(kv[0]).get("chk_ts") or 0)
+            nick, rid = items[0]
+            st = room_status(str(rid))
+            now = time.time()
+            with _lock:
+                rec = _rec_for(nick)
+                rec["chk_ts"] = now
+                if st == 2:
+                    rec["live_ts"] = now
+                    rec["fail_n"] = 0
+                    rec["web_rid"] = str(rid)
+                    rec["room_id"] = rec.get("room_id") or ""
+                    _scan_tick("ok")
+                elif st == 4:
+                    rec["live_ts"] = 0
+                    rec["fail_n"] = 0
+                    _scan_tick("down")
+                    log("巡检：%s 已下播，移出列表" % nick[:10])
+                else:
+                    n = int(rec.get("fail_n") or 0) + 1
+                    rec["fail_n"] = n
+                    _scan_tick("fail")
+                    # 连续 3 次问不出来、且已超过 1 小时没确认过 → 当作下播清掉，
+                    # 否则接口一挂列表就只增不减（踩过：132 个里大半是死房）
+                    if n >= 3 and (now - float(rec.get("live_ts") or 0)) > 3600:
+                        rec["live_ts"] = 0
+                        log("巡检：%s 连续 %d 次探测无果，移出列表" % (nick[:10], n))
+            if st == 2:
+                log("巡检：%s 在播（%s）" % (nick[:10], rid))
+            if _SCAN_HB["n"] % 150 == 0:
+                log("巡检进度：累计 %d 次，在播 %d，下播 %d，失败 %d"
+                    % (_SCAN_HB["n"], _SCAN_HB["ok"], _SCAN_HB["down"], _SCAN_HB["fail"]))
+        except Exception as e:
+            log("巡检异常 %s" % str(e)[:60])
+        time.sleep(2.0)
+
+
+def scan_guard():
+    """巡检看门狗：超过 30 分钟没有心跳就重启巡检线程"""
+    time.sleep(300)
+    while True:
+        try:
+            if _SCAN_HB["at"] and (time.time() - _SCAN_HB["at"]) > 1800:
+                age = time.time() - _SCAN_HB["at"]
+                log("巡检线程已停滞 %.0f 分钟，自动重启" % (age / 60.0))
+                _SCAN_HB["at"] = time.time()
+                threading.Thread(target=live_scanner, daemon=True).start()
+        except Exception as e:
+            log("巡检看门狗异常 %s" % str(e)[:50])
+        time.sleep(300)
+
+
+_NICKS_CACHE = (0.0, set())
+
+
+def _follow_nicks():
+    """关注名单里的昵称集合（600 秒缓存），用于过滤推荐流里的陌生人"""
+    global _NICKS_CACHE
+    now = time.time()
+    if _NICKS_CACHE[0] and now - _NICKS_CACHE[0] < 600:
+        return _NICKS_CACHE[1]
+    try:
+        users = (json.load(open(ALL_FILE, encoding="utf-8")) or {}).get("users") or {}
+        s2 = set((v.get("nick") or "").strip() for v in users.values() if isinstance(v, dict))
+        s2.discard("")
+        _NICKS_CACHE = (now, s2)
+        return s2
+    except Exception:
+        return _NICKS_CACHE[1] or set()
+
+
+_FOLLOW_CNT = (0.0, 0)
+
+
+_FEED_CACHE = {}
+FEED_TTL = 20
+
+
+def _following_count():
+    """真实关注人数：取名单文件的人数（600 秒缓存）"""
+    global _FOLLOW_CNT
+    now = time.time()
+    if _FOLLOW_CNT[0] and now - _FOLLOW_CNT[0] < 600:
+        return _FOLLOW_CNT[1]
+    try:
+        users = (json.load(open(ALL_FILE, encoding="utf-8")) or {}).get("users") or {}
+        n = len(users)
+        if n:
+            _FOLLOW_CNT = (now, n)
+        return n or _FOLLOW_CNT[1]
+    except Exception:
+        return _FOLLOW_CNT[1]
+
+
+def _rec_for(nick):
+    """按昵称拿状态记录；没有就建一条昵称键的（保证排序与更新是同一条）"""
+    nick = (nick or "").strip()
+    if not nick:
+        return {"nick": "", "live_ts": 0, "room_id": "", "web_rid": "", "chk_ts": 0}
+    rec = _state["map"].get(nick)
+    if isinstance(rec, dict):
+        return rec
+    for v in _state["map"].values():
+        if isinstance(v, dict) and (v.get("nick") or "").strip() == nick:
+            return v
+    rec = {"nick": nick, "live_ts": 0, "room_id": "", "web_rid": "", "chk_ts": 0}
+    _state["map"][nick] = rec
+    return rec
+
+
 def publish():
     """把「最近确认在播」的关注 + Top20 合成快照"""
     now = time.time()
@@ -631,6 +878,7 @@ def publish():
         rooms = []
         users_all = load_white()["users"]
         seen = set()
+        seen_nick = set()
         for uid, v in _state["map"].items():
             if v.get("live_ts") and now - v["live_ts"] < STALE:
                 ua = users_all.get(uid) or {}
@@ -644,6 +892,10 @@ def publish():
                 if not (num_rid.isdigit() and 8 <= len(num_rid) <= 14):
                     num_rid = ""
                 _nick = v.get("nick") or ua.get("nick") or ""
+                if _nick and _nick in seen_nick:
+                    continue
+                if _nick:
+                    seen_nick.add(_nick)
                 if not num_rid:
                     num_rid = load_webrids()["map"].get(_nick, "") or ""
                 rooms.append({"rid": uid, "nick": _nick,
@@ -707,7 +959,7 @@ def publish():
         by_rid[t["rid"]] = t
     merged = sorted(by_rid.values(), key=lambda x: -x["count"])
     try:
-        json.dump({"rooms": merged, "ts": int(now), "follows": _state["total"],
+        json.dump({"rooms": merged, "ts": int(now), "follows": _following_count(),
                    "live": len(merged), "full": True},
                   open(CACHE_FILE, "w", encoding="utf-8"), ensure_ascii=False)
     except Exception:
@@ -966,11 +1218,13 @@ class H(BaseHTTPRequestHandler):
                            if v.get("live_ts") and now - v["live_ts"] < STALE)
             return self._send(200, {
                 "ok": True, "cookie": len(load_cookie()) > 0,
-                "rooms": live, "follows": _state["total"],
+                "rooms": live, "follows": _following_count(),
                 "cursor": _state["cursor"], "swept": _state["swept"],
                 "blocked_for": max(0, int(_state["blocked_until"] - now)),
                 "top_age": int(now - _top["ts"]) if _top["ts"] else -1,
-                "rooms_pub": len(publish()), "page_gap": PAGE_GAP})
+                "rooms_pub": len(publish()), "page_gap": PAGE_GAP,
+                  "scan_age": int(now - _SCAN_HB["at"]) if _SCAN_HB["at"] else -1,
+                  "scan_n": _SCAN_HB["n"]})
         if path == "/stream":
             q = urllib.parse.parse_qs(qs)
             rid = (q.get("rid") or [""])[0] or (q.get("web_rid") or [""])[0]
@@ -995,6 +1249,42 @@ class H(BaseHTTPRequestHandler):
             if not uid:
                 return self._send(400, {"error": "missing uid"})
             return self._send(200, posts_of(uid, cur))
+        if path == "/feed":
+            # 推荐流：盒子直连没有签名拿不到，统一由服务端签名代取
+            try:
+                q = urllib.parse.parse_qs(qs)
+                cnt = min(30, max(5, int((q.get("count") or ["20"])[0])))
+                ri = max(1, int((q.get("ri") or ["1"])[0]))
+            except Exception:
+                cnt, ri = 20, 1
+            key = (cnt, ri)
+            now_f = time.time()
+            hit = _FEED_CACHE.get(key)
+            if hit and now_f - hit[0] < FEED_TTL:
+                return self._send(200, {"aweme_list": hit[1], "cached": True,
+                                        "ts": int(hit[0])})
+            try:
+                base = ("aid=6383&app_name=douyin_web&device_platform=webapp"
+                        "&channel=channel_pc_web&pc_client_type=1&version_code=170400"
+                        "&version_name=17.4.0&cookie_enabled=true&screen_width=1920"
+                        "&screen_height=1080&browser_language=zh-CN&browser_platform=Win32"
+                        "&browser_name=Chrome&browser_version=108.0.0.0&platform=PC")
+                url = ("https://www.douyin.com/aweme/v1/web/tab/feed/?count=%d"
+                       "&refresh_index=%d&%s" % (cnt, ri, base))
+                r = session().get(url, timeout=25)
+                j = r.json()
+                lst = j.get("aweme_list") or []
+                _FEED_CACHE[key] = (now_f, lst)
+                if len(_FEED_CACHE) > 60:
+                    _FEED_CACHE.clear()
+                    _FEED_CACHE[key] = (now_f, lst)
+                return self._send(200, {"aweme_list": lst, "cached": False,
+                                        "ts": int(now_f)})
+            except Exception as e:
+                if hit:
+                    return self._send(200, {"aweme_list": hit[1], "cached": True,
+                                            "stale": True, "ts": int(hit[0])})
+                return self._send(502, {"aweme_list": [], "error": str(e)[:80]})
         if path == "/webrids":
             m = load_webrids()["map"]
             return self._send(200, {"saved": len(m),
@@ -1038,7 +1328,7 @@ class H(BaseHTTPRequestHandler):
         if "force=1" in qs:
             threading.Thread(target=refresh_top, daemon=True).start()
         return self._send(200, {"rooms": rooms, "total": len(rooms), "full": True,
-                                "follows": _state["total"], "cursor": _state["cursor"]})
+                                "follows": _following_count(), "cursor": _state["cursor"]})
 
     def do_POST(self):
         if self.path.split("?")[0] == "/webrids":
@@ -1228,7 +1518,20 @@ if __name__ == "__main__":
     threading.Thread(target=harvester, daemon=True).start()
     threading.Thread(target=reseeder, daemon=True).start()
     threading.Thread(target=pager, daemon=True).start()
+    # 清理遗留的暂停标志：拉取被容器重启打断时 finally 不会执行，
+    # PAUSE 会一直留着把翻页扫描冻住（踩过：列表掉到 19 个一整天）
+    try:
+        if os.path.exists(PAUSE_FILE):
+            age = time.time() - os.path.getmtime(PAUSE_FILE)
+            if age > 1800:
+                os.remove(PAUSE_FILE)
+                log("清理遗留的暂停标志（已存在 %.1f 小时）" % (age / 3600.0))
+    except Exception:
+        pass
     threading.Thread(target=stats_writer, daemon=True).start()
+    threading.Thread(target=live_scanner, daemon=True).start()
+    threading.Thread(target=scan_guard, daemon=True).start()
+    log("房间号巡检器已启动：每 8 秒验一个（含心跳看门狗）")
     log("覆盖率埋点已启动：每 10 分钟写 stats.jsonl")
     threading.Thread(target=puller, daemon=True).start()
     # 补漏探活：网页关注列表里看不到的人，按短号主动确认在播（作者页标记靠它）
