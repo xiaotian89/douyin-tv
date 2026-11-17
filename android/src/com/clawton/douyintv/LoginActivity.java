@@ -149,7 +149,8 @@ public class LoginActivity extends Activity {
         new Thread(new Runnable() {
             public void run() {
                 byte[] png = httpBytes(DYPOSTS + "/login/qr" + (force ? "?force=1" : ""));
-                if (png == null || png.length < 2000) {
+                // 二维码是纯黑白图，压缩后可能只有几百字节，不能按大小判断
+                if (png == null || png.length < 200) {
                     ui.post(new Runnable() {
                         public void run() {
                             statusView.setText("二维码获取失败，按 OK 重试");
@@ -160,6 +161,15 @@ public class LoginActivity extends Activity {
                 }
                 final android.graphics.Bitmap bm =
                         android.graphics.BitmapFactory.decodeByteArray(png, 0, png.length);
+                if (bm == null) {
+                    ui.post(new Runnable() {
+                        public void run() {
+                            statusView.setText("二维码解析失败，按 OK 重试");
+                            statusView.setTextColor(Color.parseColor("#FF6B6B"));
+                        }
+                    });
+                    return;
+                }
                 ui.post(new Runnable() {
                     public void run() {
                         if (bm != null) qrView.setImageBitmap(bm);
@@ -196,6 +206,10 @@ public class LoginActivity extends Activity {
                         JSONObject o = new JSONObject(state);
                         ok = o.optBoolean("ok");
                         nick = o.optString("nick", "");
+                        // ok 只表示接口活着；真正登录成功的标志是拿到 cookie
+                        if (o.optInt("cookies", 0) <= 0 && nick.length() == 0) {
+                            ok = false;
+                        }
                     } catch (Exception ignored) {
                     }
                     if (!ok) continue;

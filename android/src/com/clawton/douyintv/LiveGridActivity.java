@@ -1575,10 +1575,78 @@ public class LiveGridActivity extends Activity {
     }
 
     private void openRoom(final Room r) {
-        if (r.flv != null && r.flv.length() > 0) {
-            play(r);
+        if (r.webRid == null || r.webRid.length() == 0 || !isNum(r.webRid)
+                || r.webRid.length() < 8 || r.webRid.length() > 14) {
+            android.widget.Toast.makeText(this,
+                    "\u300c" + (r.nick == null ? "" : r.nick) + "\u300d\u6682\u65f6\u53d6\u4e0d\u5230\u6d41\uff08\u7f3a\u623f\u95f4\u53f7\uff09",
+                    android.widget.Toast.LENGTH_LONG).show();
+            android.util.Log.i(TAG, "\u8df3\u8fc7\u53d6\u6d41\uff1a\u623f\u95f4\u53f7\u65e0\u6548 " + r.webRid);
             return;
         }
+        spin(true, "\u6b63\u5728\u83b7\u53d6 " + r.nick + " \u7684\u76f4\u64ad\u6d41\u2026");
+        final String rid = r.webRid;
+        new Thread(new Runnable() {
+            public void run() {
+                String body = null;
+                try {
+                    java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                            new java.net.URL("http://192.168.2.70:8912/stream?rid=" + rid).openConnection();
+                    c.setConnectTimeout(7000);
+                    c.setReadTimeout(18000);
+                    c.setUseCaches(false);
+                    java.io.InputStream in = c.getInputStream();
+                    java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                    in.close();
+                    body = new String(bo.toByteArray(), "UTF-8");
+                } catch (Exception e) {
+                    android.util.Log.i(TAG, "relay \u53d6\u6d41\u5931\u8d25 " + e);
+                }
+                if (body != null) {
+                    try {
+                        JSONObject j = new JSONObject(body);
+                        final boolean ok = j.optBoolean("ok");
+                        String hls = j.optString("hls", "");
+                        String flv = j.optString("flv", "");
+                        final String u = hls.length() > 0 ? hls : flv;
+                        if (ok && u.length() > 0) {
+                            final String f2 = flv;
+                            final String nk = j.optString("nick", "");
+                            final String tt = j.optString("title", "");
+                            runOnUiThread(new Runnable() {
+                                public void run() {
+                                    spin(false, "");
+                                    r.flv = u;
+                                    r.flv2 = f2;
+                                    if (nk.length() > 0) r.nick = nk;
+                                    if (tt.length() > 0) r.title = tt;
+                                    play(r);
+                                }
+                            });
+                            android.util.Log.i(TAG, "relay \u53d6\u6d41\u6210\u529f " + (u.contains(".m3u8") ? "HLS" : "FLV"));
+                            return;
+                        }
+                        if (!ok && j.optInt("status", 0) == 4) {
+                            runOnUiThread(new Runnable() {
+                                public void run() { ended(r); }
+                            });
+                            return;
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+                runOnUiThread(new Runnable() {
+                    public void run() { openRoomDirect(r); }
+                });
+            }
+        }).start();
+    }
+
+    private void openRoomDirect(final Room r) {
+        // 列表里带的地址是采集时抓的，几分钟就过期，直接播必然「取不到流」。
+        // 所以不管有没有旧地址，都先现取一次新地址再播。
         if (r.webRid == null || r.webRid.length() == 0 || !isNum(r.webRid)
                 || r.webRid.length() < 8 || r.webRid.length() > 14) {
             // 不是 12 位数字房间号（拿到的是抖音号或空）→ 取流必然失败，别去重试

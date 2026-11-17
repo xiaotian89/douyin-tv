@@ -67,8 +67,48 @@ public class WebActivity extends Activity {
         root.addView(tip, tp);
         setContentView(root);
 
-        if (url != null && url.length() > 10) web.loadUrl(url);
-        else web.loadUrl("https://www.douyin.com/");
+        final String u = (url != null && url.length() > 10) ? url : "https://www.douyin.com/";
+        // 先把服务端登录 cookie 注入，否则网页会弹滑块验证、视频不出画面
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                            new java.net.URL("http://192.168.2.70:8930/login/raw").openConnection();
+                    c.setConnectTimeout(4000);
+                    c.setReadTimeout(7000);
+                    java.io.InputStream in = c.getInputStream();
+                    java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                    byte[] bb = new byte[4096];
+                    int n;
+                    while ((n = in.read(bb)) > 0) bo.write(bb, 0, n);
+                    in.close();
+                    org.json.JSONObject j = new org.json.JSONObject(new String(bo.toByteArray(), "UTF-8"));
+                    String ck = j.optString("cookie", "");
+                    if (ck.length() > 0) {
+                        android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+                        cm.setAcceptCookie(true);
+                        int cnt = 0;
+                        for (String kv : ck.split(";")) {
+                            kv = kv.trim();
+                            if (kv.length() < 3 || kv.indexOf('=') < 1) continue;
+                            cm.setCookie(".douyin.com", kv + "; path=/");
+                            cm.setCookie("https://www.douyin.com", kv + "; path=/");
+                            cm.setCookie("https://live.douyin.com", kv + "; path=/");
+                            cnt++;
+                        }
+                        cm.flush();
+                        android.util.Log.i("DouyinTV", "WebView 注入 cookie " + cnt + " 条");
+                    }
+                } catch (Exception e) {
+                    android.util.Log.i("DouyinTV", "注入 cookie 失败 " + e);
+                }
+                runOnUiThread(new Runnable() {
+                    public void run() {
+                        web.loadUrl(u);
+                    }
+                });
+            }
+        }).start();
     }
 
     public boolean onKeyDown(int keyCode, KeyEvent e) {

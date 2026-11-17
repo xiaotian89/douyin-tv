@@ -215,9 +215,19 @@ public class FeedActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(root);
 
-        api = new Api(this);
-        String start = getIntent().getStringExtra("mode");
-        load("follow".equals(start) ? MODE_FOLLOW : MODE_FEED);
+        final String start = getIntent().getStringExtra("mode");
+        final int firstMode = "follow".equals(start) ? MODE_FOLLOW : MODE_FEED;
+        // 先把上次的列表画出来（几十毫秒），再花一秒初始化网页内核
+        if (firstMode == MODE_FEED) {
+            List<Item> quick = loadFeedCache();
+            if (quick.size() > 0) swap(quick);
+        }
+        root.postDelayed(new Runnable() {
+            public void run() {
+                api = new Api(FeedActivity.this);
+                load(firstMode);
+            }
+        }, 500);
     }
 
     @Override
@@ -287,8 +297,13 @@ public class FeedActivity extends Activity {
                 swap(feedCache);
                 return;
             }
-            spin(true, "");
-            loadFeedPages(0, new ArrayList<Item>());
+            List<Item> cachedFile = loadFeedCache();
+            if (cachedFile.size() > 0) {
+                swap(cachedFile);
+            } else {
+                spin(true, "");
+            }
+            loadFeedParallel(1, 8, true);
         } else if (m == MODE_FOLLOW) {
             titleBar.setText("我的关注");
             if (followCache.size() > 0) {
@@ -306,9 +321,148 @@ public class FeedActivity extends Activity {
      * 推荐流分页：单次 refresh_index=1 只回 2 条（网页端滚动一次也就加一屏），
      * 所以连拉 8 页凑成一屏网格，按 aweme_id 去重保序。
      */
+    private static final String FEED_CACHE_FILE = "feed_cache.json";
+
+    /** 把列表存本地，下次进页面先用它，做到秒开 */
+    private void saveFeedCache(List<Item> l) {
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray();
+            for (int i = 0; i < l.size(); i++) {
+                Item x = l.get(i);
+                org.json.JSONObject o = new org.json.JSONObject();
+                o.put("id", x.id);
+                o.put("cover", x.cover);
+                o.put("title", x.title);
+                o.put("author", x.author);
+                o.put("url", x.url);
+                o.put("sec", x.secUid);
+                o.put("dur", x.dur);
+                o.put("digg", x.digg);
+                o.put("vw", x.vw);
+                o.put("vh", x.vh);
+                arr.put(o);
+            }
+            org.json.JSONObject wrap = new org.json.JSONObject();
+            wrap.put("ts", System.currentTimeMillis());
+            wrap.put("items", arr);
+            java.io.File f = new java.io.File(getFilesDir(), FEED_CACHE_FILE);
+            java.io.FileWriter w = new java.io.FileWriter(f);
+            w.write(wrap.toString());
+            w.close();
+        } catch (Exception e) {
+            android.util.Log.i(TAG, "存缓存失败 " + e);
+        }
+    }
+
+    private List<Item> loadFeedCache() {
+        List<Item> out = new ArrayList<Item>();
+        try {
+            java.io.File f = new java.io.File(getFilesDir(), FEED_CACHE_FILE);
+            if (!f.exists() || f.length() < 10) return out;
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line);
+            r.close();
+            String raw = sb.toString();
+            org.json.JSONArray arr;
+            if (raw.startsWith("{")) {
+                org.json.JSONObject wrap = new org.json.JSONObject(raw);
+                long age = (System.currentTimeMillis() - wrap.optLong("ts", 0)) / 60000;
+                arr = wrap.optJSONArray("items");
+                android.util.Log.i(TAG, "本地缓存 " + age + " 分钟前");
+            } else {
+                arr = new org.json.JSONArray(raw);
+            }
+            if (arr == null) return out;
+            for (int i = 0; i < arr.length(); i++) {
+                org.json.JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                Item x = new Item();
+                x.id = o.optString("id");
+                x.cover = o.optString("cover");
+                x.title = o.optString("title");
+                x.author = o.optString("author");
+                x.url = o.optString("url");
+                x.secUid = o.optString("sec");
+                x.dur = o.optLong("dur");
+                x.digg = o.optInt("digg");
+                x.vw = o.optInt("vw");
+                x.vh = o.optInt("vh");
+                if (x.id.length() > 0) out.add(x);
+            }
+            android.util.Log.i(TAG, "本地缓存列表 " + out.size() + " 条");
+        } catch (Exception e) {
+            android.util.Log.i(TAG, "读缓存失败 " + e);
+        }
+        return out;
+    }
+
+    /** 并发拉取：一次发 count 个请求，收齐后合并；首批完成后继续拉下一批 */
+    private void loadFeedParallel(final int fromRi, final int count, final boolean first) {
+        final List<Item>[] slots = new List[count];
+        final java.util.concurrent.atomic.AtomicInteger left =
+                new java.util.concurrent.atomic.AtomicInteger(count);
+        for (int k = 0; k < count; k++) {
+            final int idx = k;
+            api.feed(20, fromRi + k, new Api.Cb() {
+                public void onJson(String json) {
+                    slots[idx] = parseAwemeList(json);
+                    done();
+                }
+
+                public void onError(String msg) {
+                    done();
+                }
+
+                private void done() {
+                    if (left.decrementAndGet() > 0) return;
+                    List<Item> acc = new ArrayList<Item>();
+                    for (int i = 0; i < slots.length; i++) {
+                        if (slots[i] == null) continue;
+                        for (int j = 0; j < slots[i].size(); j++) {
+                            Item x = slots[i].get(j);
+                            boolean dup = false;
+                            for (int q = 0; q < acc.size(); q++) {
+                                if (acc.get(q).id.equals(x.id)) { dup = true; break; }
+                            }
+                            if (!dup) acc.add(x);
+                        }
+                    }
+                    if (acc.isEmpty()) {
+                        if (first) spin(false, "推荐加载失败，请稍后重试");
+                        return;
+                    }
+                    // 旧内容接在后面，列表只增不减
+                    for (int i = 0; i < items.size(); i++) {
+                        Item x = items.get(i);
+                        boolean dup = false;
+                        for (int q = 0; q < acc.size(); q++) {
+                            if (acc.get(q).id.equals(x.id)) { dup = true; break; }
+                        }
+                        if (!dup) acc.add(x);
+                    }
+                    StringBuilder ids = new StringBuilder();
+                    for (int i = 0; i < acc.size() && i < 3; i++) {
+                        if (ids.length() > 0) ids.append(',');
+                        ids.append(acc.get(i).id);
+                    }
+                    android.util.Log.i(TAG, "刷新完成 " + acc.size() + " 条，前三 " + ids);
+                    feedPage = fromRi + count - 1;
+                    feedCache.clear();
+                    feedCache.addAll(acc);
+                    loadedFeed = true;
+                    swap(acc);
+                    saveFeedCache(acc);
+                    if (first) loadFeedParallel(fromRi + count, 8, false);
+                }
+            });
+        }
+    }
+
     private void loadFeedPages(final int page, final List<Item> acc) {
-        if (page >= 8) {
-            feedPage = 8;
+        if (page >= 16) {
+            feedPage = 16;
             feedCache.clear();
             feedCache.addAll(acc);
             loadedFeed = true;
@@ -351,10 +505,10 @@ public class FeedActivity extends Activity {
         loadingMore = true;
         final List<Item> acc = new ArrayList<Item>(items);
         final int from = feedPage;
-        loadFeedRange(from, from + 4, acc, new Runnable() {
+        loadFeedRange(from, from + 8, acc, new Runnable() {
             public void run() {
                 loadingMore = false;
-                feedPage = from + 4;
+                feedPage = from + 8;
                 feedCache.clear();
                 feedCache.addAll(acc);
                 items.clear();
@@ -616,6 +770,59 @@ public class FeedActivity extends Activity {
         return out;
     }
 
+    /** 提前让 NAS 把前几个作品合流好，点开就秒开 */
+    private void prefetchTop(int n) {
+        if (items == null || items.isEmpty()) return;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < items.size() && i < n; i++) {
+            String id = items.get(i).id;
+            if (id != null && id.length() > 0) {
+                if (sb.length() > 0) sb.append(',');
+                sb.append(id);
+            }
+        }
+        if (sb.length() == 0) return;
+        final String ids = sb.toString();
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                            new java.net.URL("http://192.168.2.70:8931/prefetch?ids=" + ids).openConnection();
+                    c.setConnectTimeout(4000);
+                    c.setReadTimeout(8000);
+                    c.getInputStream().close();
+                    android.util.Log.i(TAG, "预取已提交 " + ids.split(",").length + " 条");
+                } catch (Exception e) {
+                    android.util.Log.i(TAG, "预取失败 " + e);
+                }
+            }
+        }).start();
+    }
+
+    private final android.os.Handler autoRefresh = new android.os.Handler();
+    private final Runnable autoRefreshTick = new Runnable() {
+        public void run() {
+            if (mode == MODE_FEED && !loadingMore) {
+                android.util.Log.i(TAG, "定时刷新推荐列表");
+                loadFeedParallel(1, 8, true);
+            }
+            autoRefresh.postDelayed(this, 5 * 60 * 1000);
+        }
+    };
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        autoRefresh.removeCallbacks(autoRefreshTick);
+        autoRefresh.postDelayed(autoRefreshTick, 5 * 60 * 1000);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        autoRefresh.removeCallbacks(autoRefreshTick);
+    }
+
     private void swap(List<Item> l) {
         int withCover = 0, withUrl = 0;
         for (int i = 0; i < l.size(); i++) {
@@ -626,6 +833,7 @@ public class FeedActivity extends Activity {
         items.clear();
         items.addAll(l);
         adapter.notifyDataSetChanged();
+        if (mode == MODE_FEED) prefetchTop(12);
         spin(false, l.isEmpty() ? "这里没有内容" : "");
         if (l.size() > 0) {
             // GridView 要等一帧才有子 View，立刻 requestFocus 会落空（踩过：焦点停在页签上）
@@ -770,14 +978,14 @@ public class FeedActivity extends Activity {
             Item x = items.get(i);
             if (!x.playable()) continue;
             if (!first) q.append(',');
-            q.append("{\"u\":\"").append(esc(x.url)).append("\",\"t\":\"").append(esc(x.title))
+            q.append("{\"u\":\"").append(esc(proxyUrl(x))).append("\",\"t\":\"").append(esc(x.title))
                     .append("\",\"a\":\"").append(esc(x.author)).append("\"}");
             first = false;
         }
         q.append(']');
 
         Intent i = new Intent(this, PlayerActivity.class);
-        i.putExtra("url", it.url);
+        i.putExtra("url", proxyUrl(it));
         i.putExtra("title", it.title);
         i.putExtra("author", it.author);
         i.putExtra("ua", Api.desktopUa());
@@ -786,6 +994,18 @@ public class FeedActivity extends Activity {
         i.putExtra("queue", q.toString());
         i.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION);
         startActivity(i);
+    }
+
+    /** 推荐视频统一走 NAS 代理：抖音 CDN 对非浏览器请求一律 403 */
+    private String proxyUrl(Item x) {
+        if (x == null) return "";
+        if (x.id == null || x.id.length() == 0) return x.url == null ? "" : x.url;
+        try {
+            // 只传 id：地址由 NAS 端解析并缓存，URL 太长播放器会打不开
+            return "http://192.168.2.70:8931/video?id=" + x.id;
+        } catch (Exception e) {
+            return x.url == null ? "" : x.url;
+        }
     }
 
     private String esc(String s) {

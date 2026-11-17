@@ -293,6 +293,43 @@ public class Api {
         return www;
     }
 
+
+    /** 原生 HTTP GET：走中继的接口专用，WebView 里 fetch 会跨域失败 */
+    public void getNative(final String url, final Cb cb) {
+        new Thread(new Runnable() {
+            public void run() {
+                java.net.HttpURLConnection c = null;
+                try {
+                    c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                    c.setConnectTimeout(8000);
+                    c.setReadTimeout(25000);
+                    c.setRequestProperty("Accept", "application/json");
+                    int code = c.getResponseCode();
+                    java.io.InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+                    java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                    in.close();
+                    final String body = new String(bo.toByteArray(), "UTF-8");
+                    ui.post(new Runnable() {
+                        public void run() {
+                            cb.onJson(body);
+                        }
+                    });
+                } catch (final Exception e) {
+                    ui.post(new Runnable() {
+                        public void run() {
+                            cb.onError(String.valueOf(e));
+                        }
+                    });
+                } finally {
+                    if (c != null) c.disconnect();
+                }
+            }
+        }).start();
+    }
+
     private void get(final String url, final Cb cb) {
         final Host h = hostFor(url);
         if (!h.ready) {
@@ -323,8 +360,9 @@ public class Api {
 
     /** 推荐信息流；refresh 每次 +1 才拿得到下一批（网页滚动加载就是这么干的） */
     public void feed(int count, int refresh, Cb cb) {
-        get("https://www.douyin.com/aweme/v1/web/tab/feed/?count=" + count
-                + "&refresh_index=" + refresh + "&" + BASE, cb);
+        // 推荐流由 NAS 中继代取（盒子直连缺签名），且必须走原生 HTTP：
+        // WebView 里 fetch 到中继属于跨域 + 混合内容，会被直接拦掉。
+        getNative("http://192.168.2.70:8912/feed?count=" + count + "&ri=" + refresh, cb);
     }
 
     /** 我的关注（主播列表，带 is_living / room_id） */

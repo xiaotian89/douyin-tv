@@ -437,6 +437,16 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback {
             headers.put("User-Agent", ua != null && ua.length() > 0 ? ua
                     : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     + "(KHTML, like Gecko) Chrome/96.0.4664.183 Safari/537.36");
+            // 地址和取地址时的会话绑定，必须带上同一批 cookie，否则 403
+            try {
+                String ck = android.webkit.CookieManager.getInstance()
+                        .getCookie("https://www.douyin.com");
+                if (ck != null && ck.length() > 0) {
+                    headers.put("Cookie", ck);
+                    Log.i(TAG, "NATIVE 带 cookie 长度 " + ck.length());
+                }
+            } catch (Exception ignored) {
+            }
             mp.setDataSource(this, Uri.parse(videoUrl), headers);
 
             mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
@@ -462,6 +472,7 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback {
                     });
                     // 不设 setFixedSize：SurfaceView 的缓冲区由 MediaPlayer 自己配，手动设会闪抖
                     m.start();
+                    prefetchNext();
                     Log.i(TAG, "NATIVE prepared " + m.getVideoWidth() + "x" + m.getVideoHeight()
                             + " dur=" + m.getDuration());
                     if (statusView != null) {
@@ -655,6 +666,49 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback {
 
     private static String unescape(String s) {
         return s.replace("\\/", "/").replace("\\\"", "\"");
+    }
+
+    /** 从代理地址里抠出作品 id */
+    private static String idFromUrl(String u) {
+        if (u == null) return "";
+        int i = u.indexOf("id=");
+        if (i < 0) return "";
+        StringBuilder b = new StringBuilder();
+        for (int j = i + 3; j < u.length(); j++) {
+            char c = u.charAt(j);
+            if (c >= '0' && c <= '9') b.append(c);
+            else break;
+        }
+        return b.toString();
+    }
+
+    /** 看当前这条时，把后面几条的地址先解析好，切换就快 */
+    private void prefetchNext() {
+        if (queue == null || queue.isEmpty() || queuePos < 0) return;
+        StringBuilder sb = new StringBuilder();
+        for (int i = queuePos + 1; i < queue.size() && i <= queuePos + 3; i++) {
+            String id = idFromUrl(queue.get(i).url);
+            if (id.length() > 0) {
+                if (sb.length() > 0) sb.append(',');
+                sb.append(id);
+            }
+        }
+        if (sb.length() == 0) return;
+        final String ids = sb.toString();
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                            new java.net.URL("http://192.168.2.70:8931/prefetch?ids=" + ids).openConnection();
+                    c.setConnectTimeout(4000);
+                    c.setReadTimeout(8000);
+                    c.getInputStream().close();
+                    Log.i(TAG, "预载下一条 " + ids);
+                } catch (Exception e) {
+                    Log.i(TAG, "预载失败 " + e);
+                }
+            }
+        }).start();
     }
 
     private void syncQueuePos() {

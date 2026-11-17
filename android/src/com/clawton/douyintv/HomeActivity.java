@@ -465,7 +465,69 @@ public class HomeActivity extends Activity {
             statusView.setText("● 未登录 · 去「账号」扫码");
             statusView.setTextColor(Color.parseColor("#FFB74D"));
             if (accountSub != null) accountSub.setText("扫码登录");
+            statusView.setBackground(pill);
+            checkServerLogin();
+            return;
         }
         statusView.setBackground(pill);
+    }
+
+    /** 本地没 cookie 不代表用不了：数据都走 NAS 中继，服务端登录态才是关键 */
+    private void checkServerLogin() {
+        new Thread(new Runnable() {
+            public void run() {
+                String body = null;
+                for (int attempt = 0; attempt < 3 && body == null; attempt++) {
+                    try {
+                        java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                                new java.net.URL("http://192.168.2.70:8930/login/state").openConnection();
+                        c.setConnectTimeout(8000);
+                        c.setReadTimeout(12000);
+                        c.setUseCaches(false);
+                        java.io.InputStream in = c.getInputStream();
+                        java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                        byte[] buf = new byte[4096];
+                        int n;
+                        while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                        in.close();
+                        body = new String(bo.toByteArray(), "UTF-8");
+                    } catch (Exception e) {
+                        android.util.Log.i("DouyinTV", "serverlogin err" + attempt + "=" + e);
+                        try { Thread.sleep(1200); } catch (Exception ignored) {}
+                    }
+                }
+                android.util.Log.i("DouyinTV", "serverlogin body=" + body);
+                if (body == null) {
+                    runOnUiThread(new Runnable() {
+                        public void run() {
+                            statusView.setText("● 未登录 · 服务端无响应");
+                        }
+                    });
+                    return;
+                }
+                boolean ok = false;
+                try {
+                    org.json.JSONObject o = new org.json.JSONObject(body);
+                    int ck = o.optInt("cookies", 0);
+                    String src = o.optString("src", "");
+                    ok = ck > 0 || "file".equals(src) || o.optBoolean("ok");
+                } catch (Exception ignored) {
+                }
+                android.util.Log.i("DouyinTV", "serverlogin ok=" + ok);
+                if (!ok) return;
+                runOnUiThread(new Runnable() {
+                    public void run() {
+                        GradientDrawable g = new GradientDrawable();
+                        g.setCornerRadius(dp(14));
+                        g.setColor(Color.parseColor("#16241A"));
+                        g.setStroke(dp(1), Color.parseColor("#2F6B3A"));
+                        statusView.setText("● 已登录 · 服务器账号");
+                        statusView.setTextColor(Color.parseColor("#7BD88F"));
+                        statusView.setBackground(g);
+                        if (accountSub != null) accountSub.setText("已登录");
+                    }
+                });
+            }
+        }).start();
     }
 }
