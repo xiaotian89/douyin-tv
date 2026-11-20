@@ -80,6 +80,10 @@ public class LiveRoomActivity extends Activity implements SurfaceHolder.Callback
     private boolean triedLowerQ = false;
     private boolean triedHls = false;
     private boolean readyOnce = false;
+    /** 本次播放是否成功就绪过一次：区分「中途断流」和「房间已下播」 */
+    private boolean everReady = false;
+    /** 已经决定结束（下播/房间不可用），停止一切重连，等 finish */
+    private boolean ending = false;
     private int openGen = 0;
     private String hlsUrl = "";
     private boolean playerStarted = false;
@@ -560,6 +564,7 @@ public class LiveRoomActivity extends Activity implements SurfaceHolder.Callback
     }
 
     private void openPlayer() {
+        if (ending) return;
         if (url == null || url.length() == 0) return;
         if (surfaceW <= 64 || surfaceH <= 64) return;
         if (opening) return;
@@ -605,6 +610,7 @@ public class LiveRoomActivity extends Activity implements SurfaceHolder.Callback
                         opening = false;
                         retry = 0;
                         readyOnce = true;
+                        everReady = true;
                         statusView.setText((usingRelay
                                 ? ("中继 · " + vidW + "x" + vidH)
                                 : ("直连硬解 · " + vidW + "x" + vidH
@@ -612,7 +618,17 @@ public class LiveRoomActivity extends Activity implements SurfaceHolder.Callback
                                 + " · " + Q_NAME[quality]);
                         Log.i(TAG, "LIVE prepared " + vidW + "x" + vidH + " 内核=ExoPlayer");
                     } else if (state == Player.STATE_ENDED) {
-                        statusView.setText("播放结束");
+                        // 主播下播：直播流会走到 ENDED。原来只改文字、画面定住，
+                        // 遥控器按什么都不动，用户以为卡死。这里直接回列表。
+                        statusView.setText("主播已下播，返回列表…");
+                        Log.i(TAG, "LIVE 流结束（下播），1.5s 后返回列表");
+                        ending = true;
+                        ui.removeCallbacksAndMessages(null);
+                        ui.postDelayed(new Runnable() {
+                            public void run() {
+                                if (!isFinishing()) finish();
+                            }
+                        }, 1500);
                     }
                 }
 
@@ -702,6 +718,18 @@ public class LiveRoomActivity extends Activity implements SurfaceHolder.Callback
                         retry++;
                         statusView.setText("连接断开，正在重连 " + retry + "/3");
                         ui.postDelayed(new Runnable() { public void run() { openPlayer(); } }, 1500);
+                    } else if (!everReady) {
+                        // 一次都没播起来、中继/直连/降档/HLS 全试过还是失败：
+                        // 多半是房间已下播（地址 404），直接回列表，不再原地卡住。
+                        statusView.setText("主播已下播，返回列表…");
+                        Log.i(TAG, "LIVE 从未就绪且重试用尽，判定已下播，1.2s 后返回列表");
+                        ending = true;
+                        ui.removeCallbacksAndMessages(null);
+                        ui.postDelayed(new Runnable() {
+                            public void run() {
+                                if (!isFinishing()) finish();
+                            }
+                        }, 1200);
                     } else {
                         statusView.setText("连接失败，按 OK 重试");
                     }
@@ -751,6 +779,7 @@ public class LiveRoomActivity extends Activity implements SurfaceHolder.Callback
 
     private final Runnable watchdog = new Runnable() {
         public void run() {
+            if (ending) return;
             try {
                 if (prepared && mp != null) {
                     int p;
